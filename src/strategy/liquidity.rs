@@ -1,4 +1,4 @@
-use chrono::{TimeZone, Timelike};
+use chrono::{Datelike, TimeZone, Timelike};
 use chrono_tz::America::New_York;
 use serde::{Deserialize, Serialize};
 use crate::types::{calculate_atr, Candle, DirectionalBias, RelativeEqualPoints, SwingPoint};
@@ -22,16 +22,80 @@ pub struct LiquidityPool {
     pub sweep_time: Option<i64>,
 }
 
-/// Check if a given timestamp falls within the NY Killzone (08:30 to 11:00 AM NY)
+/// NY trading window, in minutes after midnight New York time.
+/// Episode 2 says he watches ~08:30-11:00, but his own trade sweeps at 11:22, so the window
+/// is a soft preference: it is extended to 12:00 (end exclusive).
+pub const NY_WINDOW_START_MIN: u32 = 8 * 60 + 30;
+pub const NY_WINDOW_END_MIN: u32 = 12 * 60;
+
+/// Minimum distance a pool must be traded through to count as a raid/sweep, in basis points
+/// of the pool price (3 bps ~= 4.4 pts on NQ at 14,800). The transcript gives no number;
+/// this is a chosen parameter. Price-relative so it stays asset-agnostic.
+pub const MIN_SWEEP_DEPTH_BPS: f64 = 3.0;
+
+/// Check if a given timestamp falls within the NY trading window (08:30 to 12:00 NY)
 pub fn is_in_ny_killzone(timestamp: i64) -> bool {
     if let Some(dt) = New_York.timestamp_opt(timestamp, 0).single() {
-        let hour = dt.hour();
-        let minute = dt.minute();
-        // 8:30 AM to 11:00 AM NY Local Time (Sweet Spot)
-        (hour == 8 && minute >= 30) || (hour == 9) || (hour == 10) || (hour == 11 && minute == 0)
+        let minutes = dt.hour() * 60 + dt.minute();
+        minutes >= NY_WINDOW_START_MIN && minutes < NY_WINDOW_END_MIN
     } else {
         false
     }
+}
+
+/// Overnight-range liquidity pools: from the prior 18:00 NY (Globex reopen) up to 08:30 NY of
+/// the current day, using only candles at or before `as_of`. Returns (buy-side high pool,
+/// sell-side low pool), or None if there is no data in that window.
+pub fn overnight_range_pools(
+    candles_1m: &[Candle],
+    day_start_time: i64,
+    as_of: i64,
+) -> Option<(LiquidityPool, LiquidityPool)> {
+    let day = New_York.timestamp_opt(day_start_time, 0).single()?.date_naive();
+    let prev = day.pred_opt()?;
+    let start = New_York
+        .with_ymd_and_hms(prev.year(), prev.month(), prev.day(), 18, 0, 0)
+        .single()?
+        .timestamp();
+    let end = New_York
+        .with_ymd_and_hms(day.year(), day.month(), day.day(), 8, 30, 0)
+        .single()?
+        .timestamp();
+
+    let mut hi: Option<(f64, i64)> = None;
+    let mut lo: Option<(f64, i64)> = None;
+    for c in candles_1m {
+        if c.time < start || c.time >= end || c.time > as_of {
+            continue;
+        }
+        if hi.map_or(true, |(p, _)| c.high > p) {
+            hi = Some((c.high, c.time));
+        }
+        if lo.map_or(true, |(p, _)| c.low < p) {
+            lo = Some((c.low, c.time));
+        }
+    }
+    let (hi_p, hi_t) = hi?;
+    let (lo_p, lo_t) = lo?;
+
+    Some((
+        LiquidityPool {
+            price: hi_p,
+            is_buy_side: true,
+            start_time: hi_t,
+            description: format!("Overnight Range High ({:.2}) [Buy Stops]", hi_p),
+            swept: false,
+            sweep_time: None,
+        },
+        LiquidityPool {
+            price: lo_p,
+            is_buy_side: false,
+            start_time: lo_t,
+            description: format!("Overnight Range Low ({:.2}) [Sell Stops]", lo_p),
+            swept: false,
+            sweep_time: None,
+        },
+    ))
 }
 
 /// Layer 4: 15-Minute Engineered Stop Hunt & Equal Highs/Lows (Episode 2: sents 279-319)
@@ -246,50 +310,90 @@ pub fn find_relative_equal_points(
 /// Detects if a candle in the Killzone has swept a key liquidity pool
 /// When HTF bias is Bearish, prioritizes Buyside sweeps (Stop Hunt on Buy Stops before expansion lower).
 /// When HTF bias is Bullish, prioritizes Sellside sweeps (Stop Hunt on Sell Stops before expansion higher).
+/// Sweep detector (Episode 2 rules 4 and 5).
+///
+/// A sweep only counts when the OPPOSITE side was raided first (the "sucker drop": sell stops
+/// are taken before the run on buy stops, mirrored for bullish), and the sweep itself must trade
+/// through the pool by at least `MIN_SWEEP_DEPTH_BPS`. The sweep candle must be inside the NY
+/// window. If both directions are eligible (neutral bias) the earlier sweep wins.
 pub fn detect_liquidity_sweep_from_pools(
     candles_exec: &[Candle],
     buyside_pools: &[LiquidityPool],
     sellside_pools: &[LiquidityPool],
     bias: Option<&DirectionalBias>,
 ) -> Option<LiquiditySweepEvent> {
-    for (idx, candle) in candles_exec.iter().enumerate() {
-        if !is_in_ny_killzone(candle.time) {
-            continue;
-        }
+    let check_buyside = bias.map(|b| *b != DirectionalBias::Bullish).unwrap_or(true);
+    let check_sellside = bias.map(|b| *b != DirectionalBias::Bearish).unwrap_or(true);
 
-        // When HTF bias is Bearish (or Neutral/None), look for sweep of Buyside Liquidity
-        let check_buyside = bias.map(|b| *b != DirectionalBias::Bullish).unwrap_or(true);
-        if check_buyside {
-            for pool in buyside_pools {
-                if candle.high > pool.price && candle.time > pool.start_time {
-                    return Some(LiquiditySweepEvent {
-                        sweep_time: candle.time,
-                        swept_level: pool.price,
-                        is_buy_side: true,
-                        sweep_extreme: candle.high,
-                        candle_index: idx,
-                    });
-                }
-            }
-        }
-
-        // When HTF bias is Bullish (or Neutral/None), look for sweep of Sellside Liquidity
-        let check_sellside = bias.map(|b| *b != DirectionalBias::Bearish).unwrap_or(true);
-        if check_sellside {
-            for pool in sellside_pools {
-                if candle.low < pool.price && candle.time > pool.start_time {
-                    return Some(LiquiditySweepEvent {
-                        sweep_time: candle.time,
-                        swept_level: pool.price,
-                        is_buy_side: false,
-                        sweep_extreme: candle.low,
-                        candle_index: idx,
-                    });
-                }
+    let mut best: Option<LiquiditySweepEvent> = None;
+    if check_buyside {
+        best = sweep_after_raid(candles_exec, buyside_pools, sellside_pools, true);
+    }
+    if check_sellside {
+        if let Some(ev) = sweep_after_raid(candles_exec, sellside_pools, buyside_pools, false) {
+            if best.as_ref().map_or(true, |b| ev.sweep_time < b.sweep_time) {
+                best = Some(ev);
             }
         }
     }
+    best
+}
 
+fn pool_depth(price: f64) -> f64 {
+    price.abs() * MIN_SWEEP_DEPTH_BPS / 10_000.0
+}
+
+/// `target_is_buy` = true: look for a buy-stop sweep, which requires a prior sell-stop raid.
+fn sweep_after_raid(
+    candles: &[Candle],
+    target_pools: &[LiquidityPool],
+    raid_pools: &[LiquidityPool],
+    target_is_buy: bool,
+) -> Option<LiquiditySweepEvent> {
+    // Rule 4: first candle that raids any opposite-side pool by the minimum depth.
+    let raid_time = candles.iter().find_map(|c| {
+        raid_pools
+            .iter()
+            .find(|p| {
+                c.time > p.start_time
+                    && if target_is_buy {
+                        c.low < p.price - pool_depth(p.price)
+                    } else {
+                        c.high > p.price + pool_depth(p.price)
+                    }
+            })
+            .map(|_| c.time)
+    })?;
+
+    // Rule 5: first in-window candle after the raid that trades through a target pool.
+    for (idx, c) in candles.iter().enumerate() {
+        if c.time <= raid_time || !is_in_ny_killzone(c.time) {
+            continue;
+        }
+        for p in target_pools {
+            if c.time <= p.start_time {
+                continue;
+            }
+            if target_is_buy && c.high > p.price + pool_depth(p.price) {
+                return Some(LiquiditySweepEvent {
+                    sweep_time: c.time,
+                    swept_level: p.price,
+                    is_buy_side: true,
+                    sweep_extreme: c.high,
+                    candle_index: idx,
+                });
+            }
+            if !target_is_buy && c.low < p.price - pool_depth(p.price) {
+                return Some(LiquiditySweepEvent {
+                    sweep_time: c.time,
+                    swept_level: p.price,
+                    is_buy_side: false,
+                    sweep_extreme: c.low,
+                    candle_index: idx,
+                });
+            }
+        }
+    }
     None
 }
 

@@ -3,6 +3,9 @@ pub mod execution;
 pub mod liquidity;
 pub mod sessions;
 
+#[cfg(test)]
+mod ep2_regression;
+
 use chrono::{Datelike, TimeZone};
 use chrono_tz::America::New_York;
 use serde::{Deserialize, Serialize};
@@ -13,9 +16,11 @@ use crate::types::{
     JournalEvent, TradeMark,
 };
 use bias::{evaluate_weekly_bias, identify_daily_draw_on_liquidity};
-use execution::{detect_market_structure_shift, evaluate_execution_entry, ExecutionSignal};
+use execution::{
+    detect_market_structure_shift, evaluate_execution_entry, sweep_leg_extreme, ExecutionSignal,
+};
 use liquidity::{
-    detect_liquidity_sweep_from_pools, find_liquidity_pools,
+    detect_liquidity_sweep_from_pools, overnight_range_pools,
     LiquidityPool, LiquiditySweepEvent,
 };
 use sessions::{frame_hourly_session, HourlySessionFrame};
@@ -100,7 +105,21 @@ pub fn run_ict_pipeline(
     let hourly_frame = frame_hourly_session(hourly_candles, daily_dol.clone());
 
     // 4. 15-Minute Liquidity Event (Engineered Pools)
-    let (buyside_pools, sellside_pools) = find_liquidity_pools(candles_15m, None);
+    // Pools: the overnight range (prior 18:00 -> 08:30 NY) of the session being run. It is closed
+    // before the trading window opens, so building it from the full session has no hindsight;
+    // the detectors below are deterministic on prefixes, so this matches the as-of replay path.
+    let session_day_start = candles_2m
+        .last()
+        .and_then(|c| New_York.timestamp_opt(c.time, 0).single())
+        .map(|dt| dt.date_naive())
+        .and_then(|d| New_York.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0).single())
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+    let (buyside_pools, sellside_pools): (Vec<LiquidityPool>, Vec<LiquidityPool>) =
+        match overnight_range_pools(candles_15m, session_day_start, i64::MAX) {
+            Some((hi, lo)) => (vec![hi], vec![lo]),
+            None => (Vec::new(), Vec::new()),
+        };
     let sweep_event = detect_liquidity_sweep_from_pools(candles_2m, &buyside_pools, &sellside_pools, Some(&weekly_bias));
 
     // 5. 1-3 Min Execution
@@ -108,17 +127,12 @@ pub fn run_ict_pipeline(
 
     if let (Some(sweep), Some(dol)) = (&sweep_event, &daily_dol) {
         if let Some((mss, fvg)) = detect_market_structure_shift(candles_2m, sweep) {
-            let day_high = candles_2m.iter().map(|c| c.high).fold(f64::MIN, f64::max);
-            let day_low = candles_2m.iter().map(|c| c.low).fold(f64::MAX, f64::min);
-
             if let Some(signal) = evaluate_execution_entry(
                 candles_2m,
                 sweep,
                 &mss,
                 &fvg,
                 dol.target_price,
-                day_high,
-                day_low,
             ) {
                 chart_marks.extend(signal.marks.clone());
                 execution_signal = Some(signal);
@@ -242,7 +256,14 @@ pub fn compute_dynamic_ict_levels(
 
     let hourly_candles = MarketDataLoader::aggregate_interval(&week_1m, 3600);
     let _candles_15m = MarketDataLoader::aggregate_interval(&week_1m, 900);
-    let candles_2m = MarketDataLoader::aggregate_interval(&day_1m, 120);
+    // `candles_2m_live` includes the in-progress candle (display only). Structure detection
+    // (sweep / MSS / FVG / entry) only sees COMPLETED 2m candles, so signals cannot flicker or
+    // be built from a half-formed bar: a 2m candle is complete once its second 1m bar exists.
+    let candles_2m_live = MarketDataLoader::aggregate_interval(&day_1m, 120);
+    let mut candles_2m = candles_2m_live.clone();
+    if candles_2m.last().map_or(false, |c| current_time < c.time + 60) {
+        candles_2m.pop();
+    }
 
     let hourly_frame = frame_hourly_session(&hourly_candles, daily_dol.clone());
     let overnight_high = hourly_frame.as_ref().map(|f| f.overnight_high);
@@ -303,58 +324,15 @@ pub fn compute_dynamic_ict_levels(
         fill_color: None,
     });
 
-    // 4. Layer 4: 15-Minute Liquidity Pools (Frame 0111)
-    // Directly linked to the 1-hour pre-market consolidation setup (Frame 0064)
-    // Pre-market window: 00:00 to 08:30 EST
-    let premarket_end = day_start_time + 30600; // 08:30 EST
-    let premarket_candles: Vec<&Candle> = week_1m
-        .iter()
-        .filter(|c| c.time >= day_start_time && c.time < premarket_end.min(current_time))
-        .collect();
-
-    let (consolidation_high, consolidation_high_time, consolidation_low, consolidation_low_time) = if premarket_candles.len() >= 30 {
-        // Sufficient pre-market candles: use current day's overnight consolidation (00:00 - 08:30)
-        let hi = premarket_candles.iter().map(|c| c.high).fold(f64::MIN, f64::max);
-        let hi_time = premarket_candles.iter().find(|c| (c.high - hi).abs() < 1e-4).map(|c| c.time).unwrap_or(day_start_time);
-        let lo = premarket_candles.iter().map(|c| c.low).fold(f64::MAX, f64::min);
-        let lo_time = premarket_candles.iter().find(|c| (c.low - lo).abs() < 1e-4).map(|c| c.time).unwrap_or(day_start_time);
-        (hi, hi_time, lo, lo_time)
-    } else {
-        // Early session fallback (e.g. before 04:00 AM / at 00:38): use previous day's consolidation
-        let prev_day_candles: Vec<&Candle> = all_1m_candles
-            .iter()
-            .filter(|c| c.time >= day_start_time - 86400 && c.time < day_start_time)
-            .collect();
-        if !prev_day_candles.is_empty() {
-            let hi = prev_day_candles.iter().map(|c| c.high).fold(f64::MIN, f64::max);
-            let hi_time = prev_day_candles.iter().find(|c| (c.high - hi).abs() < 1e-4).map(|c| c.time).unwrap_or(day_start_time - 86400);
-            let lo = prev_day_candles.iter().map(|c| c.low).fold(f64::MAX, f64::min);
-            let lo_time = prev_day_candles.iter().find(|c| (c.low - lo).abs() < 1e-4).map(|c| c.time).unwrap_or(day_start_time - 86400);
-            (hi, hi_time, lo, lo_time)
-        } else {
-            (14800.0, day_start_time, 14600.0, day_start_time)
-        }
+    // 4. Layer 4: Overnight-range liquidity pools (Episode 2 rule 3): prior 18:00 NY to
+    // 08:30 NY, using only data up to the replay clock. No hardcoded fallback levels: with no
+    // overnight data there are no pools and therefore no sweep or signal.
+    let overnight = overnight_range_pools(all_1m_candles, day_start_time, current_time);
+    let (buyside_pools, sellside_pools): (Vec<LiquidityPool>, Vec<LiquidityPool>) = match &overnight {
+        Some((hi, lo)) => (vec![hi.clone()], vec![lo.clone()]),
+        None => (Vec::new(), Vec::new()),
     };
-
-    let equilibrium_15m = (consolidation_high + consolidation_low) / 2.0;
-
-    let buyside_pools = vec![LiquidityPool {
-        price: consolidation_high,
-        is_buy_side: true,
-        start_time: consolidation_high_time,
-        description: format!("Overnight Consolidation High ({:.2}) [Buy Stops]", consolidation_high),
-        swept: false,
-        sweep_time: None,
-    }];
-
-    let sellside_pools = vec![LiquidityPool {
-        price: consolidation_low,
-        is_buy_side: false,
-        start_time: consolidation_low_time,
-        description: format!("Overnight Consolidation Low ({:.2}) [Sell Stops]", consolidation_low),
-        swept: false,
-        sweep_time: None,
-    }];
+    let equilibrium_15m: Option<f64> = overnight.as_ref().map(|(hi, lo)| (hi.price + lo.price) / 2.0);
 
     let primary_buyside = buyside_pools.first();
     let primary_sellside = sellside_pools.first();
@@ -410,28 +388,34 @@ pub fn compute_dynamic_ict_levels(
     }
 
     // Dealing range and equilibrium (Frame 0111: exactly the 50% Equilibrium line)
-    indicators.push(ChartIndicator {
-        id: "eq_15m".to_string(),
-        indicator_type: "trend_line".to_string(),
-        timeframe: "15".to_string(),
-        points: vec![
-            IndicatorPoint { time: day_start_time, price: equilibrium_15m },
-            IndicatorPoint { time: current_time + 3600, price: equilibrium_15m },
-        ],
-        label: format!("50% Equilibrium ({:.2})", equilibrium_15m),
-        color: "#ffeb3b".to_string(),
-        line_style: 2,
-        line_width: 1,
-        fill_color: None,
-    });
+    if let Some(equilibrium_15m) = equilibrium_15m {
+        indicators.push(ChartIndicator {
+            id: "eq_15m".to_string(),
+            indicator_type: "trend_line".to_string(),
+            timeframe: "15".to_string(),
+            points: vec![
+                IndicatorPoint { time: day_start_time, price: equilibrium_15m },
+                IndicatorPoint { time: current_time + 3600, price: equilibrium_15m },
+            ],
+            label: format!("50% Equilibrium ({:.2})", equilibrium_15m),
+            color: "#ffeb3b".to_string(),
+            line_style: 2,
+            line_width: 1,
+            fill_color: None,
+        });
+    }
 
     // 2m Dealing Range Boundaries
-    let (dealing_range_high, dealing_range_low, equilibrium_50) = if !candles_2m.is_empty() {
-        let hi = candles_2m.iter().map(|c| c.high).fold(f64::MIN, f64::max);
-        let lo = candles_2m.iter().map(|c| c.low).fold(f64::MAX, f64::min);
+    // Display-only running range (includes the in-progress candle); the premium/discount
+    // decision itself is made as-of FVG formation inside `evaluate_execution_entry`.
+    let (dealing_range_high, dealing_range_low, equilibrium_50) = if !candles_2m_live.is_empty() {
+        let hi = candles_2m_live.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+        let lo = candles_2m_live.iter().map(|c| c.low).fold(f64::MAX, f64::min);
         (Some(hi), Some(lo), Some((hi + lo) / 2.0))
+    } else if let Some((hi, lo)) = &overnight {
+        (Some(hi.price), Some(lo.price), equilibrium_15m)
     } else {
-        (Some(consolidation_high), Some(consolidation_low), Some(equilibrium_15m))
+        (None, None, None)
     };
 
     if let (Some(hi), Some(lo), Some(eq)) = (dealing_range_high, dealing_range_low, equilibrium_50) {
@@ -483,13 +467,27 @@ pub fn compute_dynamic_ict_levels(
 
     // 5. Sweep Detection
     let sweep_event = detect_liquidity_sweep_from_pools(&candles_2m, &buyside_pools, &sellside_pools, Some(&weekly_bias));
+    let mss_result = sweep_event
+        .as_ref()
+        .and_then(|sw| detect_market_structure_shift(&candles_2m, sw));
+    // The sweep marker sits at the true extreme of the sweep leg (through the MSS candle if one
+    // has printed, otherwise through the latest completed candle).
+    let sweep_display_extreme: Option<f64> = sweep_event.as_ref().map(|sw| {
+        let end = mss_result
+            .as_ref()
+            .map(|(m, _)| m.displacement_candle_time)
+            .or_else(|| candles_2m.last().map(|c| c.time))
+            .unwrap_or(sw.sweep_time);
+        sweep_leg_extreme(&candles_2m, sw, end)
+    });
 
     if let Some(ref sweep) = sweep_event {
+        let marker_extreme = sweep_display_extreme.unwrap_or(sweep.sweep_extreme);
         indicators.push(ChartIndicator {
             id: "sweep_marker".to_string(),
             indicator_type: "marker".to_string(),
             timeframe: "2".to_string(),
-            points: vec![IndicatorPoint { time: sweep.sweep_time, price: sweep.sweep_extreme }],
+            points: vec![IndicatorPoint { time: sweep.sweep_time, price: marker_extreme }],
             label: format!("15m Stop Hunt Sweep at {:.2}", sweep.swept_level),
             color: if sweep.is_buy_side { "#e91e63".to_string() } else { "#4caf50".to_string() },
             line_style: 0,
@@ -502,7 +500,7 @@ pub fn compute_dynamic_ict_levels(
             time_str: time_str.clone(),
             level: "SIGNAL".to_string(),
             category: "LIQUIDITY".to_string(),
-            message: format!("Stop Hunt Sweep Confirmed! Swept 15m level {:.2}. Extreme price at {:.2}.", sweep.swept_level, sweep.sweep_extreme),
+            message: format!("Stop Hunt Sweep Confirmed! Swept level {:.2}. Extreme price at {:.2}.", sweep.swept_level, marker_extreme),
         });
     }
 
@@ -523,7 +521,7 @@ pub fn compute_dynamic_ict_levels(
     let mut target_imbalance_bottom = None;
 
     if let (Some(sweep), Some(dol)) = (&sweep_event, &daily_dol) {
-        if let Some((mss, fvg)) = detect_market_structure_shift(&candles_2m, sweep) {
+        if let Some((mss, fvg)) = mss_result.clone() {
             fvg_top = Some(fvg.top);
             fvg_bottom = Some(fvg.bottom);
             fvg_midpoint = Some(fvg.midpoint);
@@ -570,15 +568,13 @@ pub fn compute_dynamic_ict_levels(
                 message: format!("Displacement confirmed! BMS broken at {:.2}. FVG born at [{:.2} - {:.2}].", mss.broken_swing.price, fvg.bottom, fvg.top),
             });
 
-            if let (Some(hi), Some(lo)) = (dealing_range_high, dealing_range_low) {
+            {
                 if let Some(signal) = evaluate_execution_entry(
                     &candles_2m,
                     sweep,
                     &mss,
                     &fvg,
                     dol.target_price,
-                    hi,
-                    lo,
                 ) {
                     has_signal = true;
                     signal_is_short = Some(signal.is_short);
@@ -665,7 +661,7 @@ pub fn compute_dynamic_ict_levels(
         sellside_liquidity: primary_sellside.map(|p| p.price),
         sweep_time: sweep_event.as_ref().map(|s| s.sweep_time),
         sweep_level: sweep_event.as_ref().map(|s| s.swept_level),
-        sweep_extreme: sweep_event.as_ref().map(|s| s.sweep_extreme),
+        sweep_extreme: sweep_display_extreme,
         is_buy_sweep: sweep_event.as_ref().map(|s| s.is_buy_side),
         dealing_range_high,
         dealing_range_low,
