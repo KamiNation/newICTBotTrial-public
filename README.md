@@ -52,8 +52,8 @@ The application strictly separates **Market Data Ingestion & Live Replay** from 
 
 ```bash
 # Clone the repository
-git clone git@github.com:KamiNation/newICTBotTrial.git
-cd newICTBotTrial
+git clone git@github.com:KamiNation/newICTBotTrial-public.git
+cd newICTBotTrial-public
 
 # Compile and start the engine
 cargo run
