@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ICT 2022 Mentorship Episode 2 - Real-Time Replay & Bot Engine</title>
+    <script type="text/javascript" src="/charting_library/charting_library.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #131722; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #d1d4dc; }
+        
+        #topbar {
+            height: 48px;
+            background: #1e222d;
+            border-bottom: 1px solid #2a2e39;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+        }
+
+        #hud-bar {
+            height: 38px;
+            background: #181b24;
+            border-bottom: 1px solid #2a2e39;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            font-size: 12px;
+        }
+        
+        .header-title-box {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .title {
+            font-weight: 700;
+            font-size: 14px;
+            color: #2962ff;
+            letter-spacing: 0.3px;
+        }
+
+        .badge {
+            background: #2a2e39;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .badge-bullish {
+            background: #1b5e20;
+            color: #4caf50;
+        }
+
+        .badge-bearish {
+            background: #b71c1c;
+            color: #ff8a80;
+        }
+
+        .badge-live {
+            background: #1b5e20;
+            color: #4caf50;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .badge-live::before {
+            content: '';
+            width: 7px;
+            height: 7px;
+            background: #4caf50;
+            border-radius: 50%;
+            display: inline-block;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 0.4; }
+            50% { opacity: 1; }
+            100% { opacity: 0.4; }
+        }
+
+        /* Controls */
+        #replay-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn {
+            background: #2a2e39;
+            color: #d1d4dc;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .btn:hover {
+            background: #363a45;
+            color: #fff;
+        }
+
+        .btn-play {
+            background: #2962ff;
+            color: #fff;
+        }
+        .btn-play:hover {
+            background: #1e4bd8;
+        }
+
+        .btn-pause {
+            background: #ff9800;
+            color: #131722;
+        }
+        .btn-pause:hover {
+            background: #e68900;
+        }
+
+        .btn-active {
+            background: #00897b;
+            color: #fff;
+        }
+
+        .btn-tf {
+            padding: 4px 9px;
+            font-size: 11px;
+            font-weight: 700;
+            border-radius: 4px;
+            background: #232733;
+            color: #90caf9;
+            cursor: pointer;
+            border: 1px solid #363a45;
+            transition: all 0.15s ease;
+        }
+
+        .btn-tf:hover {
+            background: #2a3142;
+            color: #ffffff;
+            border-color: #2962ff;
+        }
+
+        .btn-tf.active-tf {
+            background: #2962ff !important;
+            color: #ffffff !important;
+            border-color: #2962ff !important;
+            box-shadow: 0 0 6px rgba(41, 98, 255, 0.4);
+        }
+
+        .speed-select {
+            background: #2a2e39;
+            color: #d1d4dc;
+            border: 1px solid #363a45;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .hud-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .hud-label {
+            color: #787b86;
+            font-weight: 500;
+        }
+
+        .status-pill {
+            font-family: monospace;
+            font-size: 12px;
+            color: #b2b5be;
+            padding: 0 6px;
+        }
+
+        #tv_chart_container {
+            width: 100%;
+            height: calc(100% - 86px - 145px);
+            transition: height 0.2s ease;
+        }
+
+        #tv_chart_container.journal-collapsed {
+            height: calc(100% - 86px - 28px);
+        }
+
+        #journal-panel {
+            width: 100%;
+            height: 145px;
+            background: #131722;
+            border-top: 1px solid #2a2e39;
+            display: flex;
+            flex-direction: column;
+            transition: height 0.2s ease;
+            box-sizing: border-box;
+        }
+
+        #journal-panel.collapsed {
+            height: 28px;
+        }
+
+        #journal-header {
+            height: 28px;
+            background: #1e222d;
+            border-bottom: 1px solid #2a2e39;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 14px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            user-select: none;
+            color: #90caf9;
+        }
+
+        #journal-header:hover {
+            background: #252a37;
+        }
+
+        #journal-logs {
+            flex: 1;
+            overflow-y: auto;
+            padding: 6px 14px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 11px;
+            line-height: 1.6;
+            background: #0f121a;
+        }
+
+        .log-entry {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            padding: 2px 0;
+            border-bottom: 1px solid #181c26;
+        }
+
+        .log-time {
+            color: #787b86;
+            white-space: nowrap;
+            font-size: 10px;
+        }
+
+        .log-cat {
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .log-cat-HTF_BIAS { background: #4a148c; color: #e1bee7; }
+        .log-cat-DAILY_DOL { background: #b71c1c; color: #ffcdd2; }
+        .log-cat-SESSION { background: #0d47a1; color: #bbdefb; }
+        .log-cat-LIQUIDITY { background: #880e4f; color: #f8bbd0; }
+        .log-cat-STRUCTURE { background: #006064; color: #b2ebf2; }
+        .log-cat-EXECUTION { background: #1b5e20; color: #c8e6c9; }
+
+        .log-msg {
+            color: #d1d4dc;
+            word-break: break-word;
+        }
+    </style>
+</head>
+<body>
+    <div id="topbar">
+        <div class="header-title-box">
+            <span class="title">ICT 2022 Mentorship</span>
+            <span class="badge" style="color: #90caf9;">Episode 2 Replay</span>
+            <span class="badge">E-Mini NASDAQ 100 (NQH22)</span>
+            <span class="badge badge-live" id="stream-indicator">Connecting...</span>
+        </div>
+
+        <!-- Dynamic Timeframe Switcher Bar -->
+        <div id="tf-selector" style="display: flex; align-items: center; gap: 5px;">
+            <span style="font-size: 11px; color: #787b86; font-weight: 600;">TF:</span>
+            <button class="btn-tf" data-tf="1W" onclick="switchTimeframe('1W')" title="Weekly: Macro Bias & Cycle">1W</button>
+            <button class="btn-tf" data-tf="1D" onclick="switchTimeframe('1D')" title="Daily: Frame 0063 Draw on Liquidity">1D</button>
+            <button class="btn-tf" data-tf="60" onclick="switchTimeframe('60')" title="1-Hour: Frame 0064 Monday/Friday Sessions">1h</button>
+            <button class="btn-tf" data-tf="15" onclick="switchTimeframe('15')" title="15-Minute: Frame 0111 Liquidity Pools">15m</button>
+            <button class="btn-tf active-tf" data-tf="2" onclick="switchTimeframe('2')" title="2-Minute: Execution Setup (Frames 0180, 0024, 0091, 0126)">2m</button>
+            <button class="btn-tf" data-tf="1" onclick="switchTimeframe('1')" title="1-Minute: Micro Scalping">1m</button>
+        </div>
+
+        <div id="replay-controls">
+            <label style="font-size: 11px; color: #787b86;">Start Point:</label>
+            <select class="speed-select" id="start-point-select" onchange="changeStartPoint(this.value)">
+                <option value="episode2" selected>Episode 2 Morning (Jan 21, 2022 09:30 EST)</option>
+                <option value="point_x">Point X - Oct 2021 (Macro Cycle)</option>
+            </select>
+
+            <button class="btn btn-play" id="btn-play-pause" onclick="togglePlayPause()">
+                <span id="play-icon">▶</span> <span id="play-label">Play</span>
+            </button>
+            <button class="btn" onclick="stepForward()" title="Advance 1 Minute">
+                ⏭ Step
+            </button>
+            <button class="btn" onclick="resetReplay()" title="Reset to Replay Start">
+                ↺ Reset
+            </button>
+            
+            <div style="border-left: 1px solid #2a2e39; height: 16px; margin: 0 4px;"></div>
+            
+            <label style="font-size: 11px; color: #787b86;">Speed:</label>
+            <select class="speed-select" id="speed-select" onchange="changeSpeed(this.value)">
+                <option value="1">1x (Real-Time)</option>
+                <option value="2">2x</option>
+                <option value="5" selected>5x (Fast)</option>
+                <option value="10">10x (Quick)</option>
+                <option value="50">50x (Ultra)</option>
+            </select>
+
+            <button class="btn btn-active" id="btn-toggle-ict" onclick="toggleIctOverlays()">
+                👁 ICT Overlays: ON
+            </button>
+        </div>
+    </div>
+
+    <!-- Live Multi-Timeframe HUD -->
+    <div id="hud-bar">
+        <div class="hud-item">
+            <span class="hud-label">Layer 1 (Weekly Bias):</span>
+            <span class="badge badge-bearish" id="hud-weekly-bias">BEARISH</span>
+        </div>
+        <div class="hud-item">
+            <span class="hud-label">Layer 2 (Daily DOL):</span>
+            <span class="badge" id="hud-daily-dol" style="color: #ff8a80;">Sell-Side Liquidity: 14,366.75</span>
+        </div>
+        <div class="hud-item">
+            <span class="hud-label">Active Setup:</span>
+            <span class="badge" id="hud-setup" style="color: #90caf9;">15m Buy Stop Hunt &rarr; 2m Bearish FVG Retest</span>
+        </div>
+        <div class="hud-item">
+            <div class="status-pill" id="time-display">Time: Loading...</div>
+            <div class="status-pill" id="price-display" style="color: #2962ff; font-weight: bold;">--.--</div>
+        </div>
+    </div>
+
+    <div id="tv_chart_container"></div>
+
+    <!-- Live Autonomous Strategy Journal & Audit Log Console -->
+    <div id="journal-panel">
+        <div id="journal-header" onclick="toggleJournal()">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span>📜 Autonomous Strategy Journal & Audit Log</span>
+                <span class="badge" id="journal-count" style="background: #2a2e39; color: #90caf9;">0 entries</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <span style="font-size: 10px; color: #787b86;">(State Machine Decisions)</span>
+                <span id="journal-toggle-icon" style="font-size: 10px;">▼ Minimize</span>
+            </div>
+        </div>
+        <div id="journal-logs">
+            <div style="color: #787b86; font-style: italic;">Strategy Journal initialized. Awaiting market ticks...</div>
+        </div>
+    </div>
+
+    <script type="text/javascript">
+        const activeSubscribers = {};
+        let isPlaying = false;
+        let ws = null;
+        let showIctOverlays = true;
+        let drawnShapes = [];
+
+        function connectWebSocket() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws/replay`);
+
+            ws.onopen = () => {
+                const badge = document.getElementById('stream-indicator');
+                badge.innerText = 'Connected';
+                badge.style.background = '#1b5e20';
+                badge.style.color = '#4caf50';
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === 'bar_update') {
+                        const bar = msg.bar;
+                        for (const uid in activeSubscribers) {
+                            const sub = activeSubscribers[uid];
+                            sub.callback({
+                                time: bar.time * 1000,
+                                open: bar.open,
+                                high: bar.high,
+                                low: bar.low,
+                                close: bar.close,
+                                volume: bar.volume
+                            });
+                        }
+                    } else if (msg.type === 'status') {
+                        updateStatusUI(msg.status);
+                    }
+                } catch (e) {
+                    console.error('Error handling WS message:', e);
+                }
+            };
+
+            ws.onclose = () => {
+                const badge = document.getElementById('stream-indicator');
+                badge.innerText = 'Disconnected';
+                badge.style.background = '#b71c1c';
+                badge.style.color = '#ff8a80';
+                setTimeout(connectWebSocket, 2000);
+            };
+        }
+
+        function updateStatusUI(status) {
+            isPlaying = status.is_playing;
+            const playIcon = document.getElementById('play-icon');
+            const playLabel = document.getElementById('play-label');
+            const btn = document.getElementById('btn-play-pause');
+
+            if (isPlaying) {
+                playIcon.innerText = '❚❚';
+                playLabel.innerText = 'Pause';
+                btn.className = 'btn btn-pause';
+            } else {
+                playIcon.innerText = '▶';
+                playLabel.innerText = 'Play';
+                btn.className = 'btn btn-play';
+            }
+
+            // Update Time and Price
+            document.getElementById('time-display').innerText = `NY: ${status.current_time_str.split(' ')[1] || status.current_time_str}`;
+            document.getElementById('price-display').innerText = `${status.current_price.toFixed(2)}`;
+
+            // Update Dynamic MTF HUD
+            const biasBadge = document.getElementById('hud-weekly-bias');
+            biasBadge.innerText = status.weekly_bias;
+            if (status.weekly_bias === 'BULLISH') {
+                biasBadge.className = 'badge badge-bullish';
+            } else if (status.weekly_bias === 'BEARISH') {
+                biasBadge.className = 'badge badge-bearish';
+            } else {
+                biasBadge.className = 'badge';
+            }
+
+            document.getElementById('hud-daily-dol').innerText = status.daily_dol;
+
+            const select = document.getElementById('start-point-select');
+            if (select && select.value !== status.start_point) {
+                select.value = status.start_point;
+            }
+        }
+
+        function togglePlayPause() {
+            const action = isPlaying ? 'Pause' : 'Play';
+            fetch('/api/replay/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: action })
+            });
+        }
+
+        function stepForward() {
+            fetch('/api/replay/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'Step' })
+            });
+        }
+
+        function resetReplay() {
+            fetch('/api/replay/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'Reset' })
+            }).then(() => {
+                if (window.tvWidget) {
+                    window.tvWidget.activeChart().resetData();
+                }
+            });
+        }
+
+        function changeSpeed(val) {
+            fetch('/api/replay/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'SetSpeed', payload: parseFloat(val) })
+            });
+        }
+
+        function changeStartPoint(point) {
+            fetch('/api/replay/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'SetStartPoint', payload: point })
+            }).then(() => {
+                if (window.tvWidget) {
+                    const targetResolution = (point === 'point_x') ? '1W' : '2';
+                    switchTimeframe(targetResolution);
+                    window.tvWidget.activeChart().resetData();
+                }
+            });
+        }
+
+        let currentInterval = '2';
+        let latestIctLevels = null;
+
+        function switchTimeframe(tf) {
+            currentInterval = tf;
+            updateTfButtons(tf);
+            if (window.tvWidget && window.tvWidget.activeChart()) {
+                window.tvWidget.activeChart().setResolution(tf);
+            }
+        }
+
+        function updateTfButtons(tf) {
+            const buttons = document.querySelectorAll('.btn-tf');
+            buttons.forEach(btn => {
+                const btnTf = btn.getAttribute('data-tf');
+                const isMatch = btnTf === tf || 
+                    (tf === 'D' && btnTf === '1D') || 
+                    (tf === 'W' && btnTf === '1W') ||
+                    (tf === '60' && btnTf === '60');
+                if (isMatch) {
+                    btn.classList.add('active-tf');
+                } else {
+                    btn.classList.remove('active-tf');
+                }
+            });
+        }
+
+        function toggleIctOverlays() {
+            showIctOverlays = !showIctOverlays;
+            const btn = document.getElementById('btn-toggle-ict');
+            if (showIctOverlays) {
+                btn.innerText = '👁 ICT Overlays: ON';
+                btn.className = 'btn btn-active';
+                fetchAndRenderOverlays(currentInterval);
+            } else {
+                btn.innerText = '👁 ICT Overlays: OFF';
+                btn.className = 'btn';
+                clearDrawnShapes();
+            }
+        }
+
+        function clearDrawnShapes() {
+            if (window.tvWidget && window.tvWidget.activeChart()) {
+                const chart = window.tvWidget.activeChart();
+                for (const id of drawnShapes) {
+                    try { chart.removeEntity(id); } catch (e) {}
+                }
+                drawnShapes = [];
+            }
+        }
+
+        function toggleJournal() {
+            const panel = document.getElementById('journal-panel');
+            const chartCont = document.getElementById('tv_chart_container');
+            const icon = document.getElementById('journal-toggle-icon');
+            if (panel.classList.contains('collapsed')) {
+                panel.classList.remove('collapsed');
+                chartCont.classList.remove('journal-collapsed');
+                icon.innerText = '▼ Minimize';
+            } else {
+                panel.classList.add('collapsed');
+                chartCont.classList.add('journal-collapsed');
+                icon.innerText = '▲ Expand';
+            }
+        }
+
+        function updateJournalUI(logs) {
+            const container = document.getElementById('journal-logs');
+            const countBadge = document.getElementById('journal-count');
+            if (!container || !logs) return;
+
+            countBadge.innerText = `${logs.length} entries`;
+
+            container.innerHTML = logs.map(l => {
+                const timeOnly = l.time_str.split(' ')[1] || l.time_str;
+                return `
+                    <div class="log-entry">
+                        <span class="log-time">${timeOnly}</span>
+                        <span class="log-cat log-cat-${l.category}">${l.category}</span>
+                        <span class="log-msg">${l.message}</span>
+                    </div>
+                `;
+            }).join('');
+
+            container.scrollTop = container.scrollHeight;
+        }
+
+        async function fetchAndRenderOverlays(interval) {
+            if (!interval) interval = currentInterval;
+            try {
+                const res = await fetch('/api/ict/levels');
+                if (res.ok) {
+                    latestIctLevels = await res.json();
+                    if (latestIctLevels.journal_logs) {
+                        updateJournalUI(latestIctLevels.journal_logs);
+                    }
+                }
+            } catch (e) {
+                console.warn('Failed to fetch dynamic ICT levels:', e);
+            }
+
+            if (showIctOverlays) {
+                renderTimeframeOverlays(interval, latestIctLevels);
+            }
+        }
+
+        // Pure backend-driven indicator renderer: plots bounded trendlines, rectangles, rays, and markers
+        // No hardcoded numbers or static coordinates.
+        function renderTimeframeOverlays(interval, levels) {
+            if (!window.tvWidget || !showIctOverlays) return;
+            const chart = window.tvWidget.activeChart();
+            if (!chart) return;
+
+            clearDrawnShapes();
+            if (!levels || !levels.indicators) return;
+
+            const tf = (interval || currentInterval || '2').toUpperCase();
+
+            // Filter indicators belonging to this timeframe or ALL
+            const toDraw = levels.indicators.filter(ind => {
+                const indTf = ind.timeframe.toUpperCase();
+                return indTf === tf || indTf === 'ALL' ||
+                    (tf === 'D' && indTf === '1D') ||
+                    (tf === 'W' && indTf === '1W') ||
+                    (tf === '60' && indTf === '60');
+            });
+
+            for (const ind of toDraw) {
+                try {
+                    if (ind.indicator_type === 'trend_line') {
+                        if (ind.points.length >= 2) {
+                            const p1 = ind.points[0];
+                            const p2 = ind.points[1];
+                            const shapeId = chart.createMultipointShape(
+                                [
+                                    { time: p1.time, price: p1.price },
+                                    { time: p2.time, price: p2.price }
+                                ],
+                                {
+                                    shape: 'trend_line',
+                                    lock: true,
+                                    disableSelection: true,
+                                    text: ind.label,
+                                    overrides: {
+                                        linecolor: ind.color,
+                                        linewidth: ind.line_width || 2,
+                                        linestyle: ind.line_style || 0,
+                                        textcolor: ind.color,
+                                        fontsize: 11
+                                    }
+                                }
+                            );
+                            if (shapeId) drawnShapes.push(shapeId);
+                        }
+                    } else if (ind.indicator_type === 'vertical_line') {
+                        if (ind.points.length >= 1) {
+                            const p = ind.points[0];
+                            const shapeId = chart.createShape(
+                                { time: p.time, price: p.price || 0 },
+                                {
+                                    shape: 'vertical_line',
+                                    lock: true,
+                                    disableSelection: true,
+                                    text: ind.label,
+                                    overrides: {
+                                        linecolor: ind.color,
+                                        linewidth: ind.line_width || 1,
+                                        linestyle: ind.line_style || 2,
+                                        textcolor: ind.color,
+                                        fontsize: 11
+                                    }
+                                }
+                            );
+                            if (shapeId) drawnShapes.push(shapeId);
+                        }
+                    } else if (ind.indicator_type === 'rectangle') {
+                        if (ind.points.length >= 2) {
+                            const p1 = ind.points[0];
+                            const p2 = ind.points[1];
+                            const shapeId = chart.createMultipointShape(
+                                [
+                                    { time: p1.time, price: p1.price },
+                                    { time: p2.time, price: p2.price }
+                                ],
+                                {
+                                    shape: 'rectangle',
+                                    lock: true,
+                                    disableSelection: true,
+                                    text: ind.label,
+                                    overrides: {
+                                        color: ind.color,
+                                        borderColor: ind.color,
+                                        borderWidth: ind.line_width || 2,
+                                        backgroundColor: ind.fill_color || 'rgba(255, 152, 0, 0.25)',
+                                        fillBackground: true,
+                                        fontsize: 11
+                                    }
+                                }
+                            );
+                            if (shapeId) drawnShapes.push(shapeId);
+                        }
+                    } else if (ind.indicator_type === 'marker') {
+                        if (ind.points.length >= 1) {
+                            const p = ind.points[0];
+                            const shapeId = chart.createShape(
+                                { time: p.time, price: p.price },
+                                {
+                                    shape: 'arrow_down',
+                                    lock: true,
+                                    disableSelection: true,
+                                    text: ind.label,
+                                    overrides: {
+                                        color: ind.color,
+                                        textcolor: ind.color,
+                                        fontsize: 11
+                                    }
+                                }
+                            );
+                            if (shapeId) drawnShapes.push(shapeId);
+                        }
+                    }
+                } catch (err) {
+                    console.warn(`Error drawing indicator ${ind.id}:`, err);
+                }
+            }
+
+            console.log(`Rendered ${toDraw.length} dynamic ICT indicators for [${tf}]`);
+        }
+
+        // Initialize TradingView Widget
+        window.addEventListener('DOMContentLoaded', () => {
+            connectWebSocket();
+
+            const customDatafeed = {
+                onReady: (callback) => {
+                    fetch('/config').then(r => r.json()).then(data => callback(data));
+                },
+                searchSymbols: (userInput, exchange, symbolType, onResultReadyCallback) => {
+                    onResultReadyCallback([]);
+                },
+                resolveSymbol: (symbolName, onSymbolResolvedCallback, onResolveErrorCallback) => {
+                    fetch(`/symbols?symbol=${symbolName}`).then(r => r.json()).then(data => onSymbolResolvedCallback(data));
+                },
+                getServerTime: (callback) => {
+                    fetch('/time').then(r => r.text()).then(t => callback(parseInt(t)));
+                },
+                getBars: (symbolInfo, resolution, periodParams, onHistoryCallback, onErrorCallback) => {
+                    const { from, to, countBack, firstDataRequest } = periodParams;
+                    fetch(`/history?symbol=${symbolInfo.name}&resolution=${resolution}&from=${from}&to=${to}&countBack=${countBack || 500}&firstDataRequest=${firstDataRequest || false}`)
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.s === 'ok' && data.t && data.t.length > 0) {
+                                const bars = [];
+                                for (let i = 0; i < data.t.length; i++) {
+                                    bars.push({
+                                        time: data.t[i] * 1000,
+                                        open: data.o[i],
+                                        high: data.h[i],
+                                        low: data.l[i],
+                                        close: data.c[i],
+                                        volume: data.v ? data.v[i] : 0
+                                    });
+                                }
+                                onHistoryCallback(bars, { noData: false });
+                            } else if (data.s === 'no_data') {
+                                onHistoryCallback([], {
+                                    noData: true,
+                                    nextTime: data.nextTime ? data.nextTime * 1000 : null
+                                });
+                            } else {
+                                onHistoryCallback([], { noData: true });
+                            }
+                        })
+                        .catch(err => onErrorCallback(err));
+                },
+                subscribeBars: (symbolInfo, resolution, onRealtimeCallback, subscriberUID, onResetCacheNeededCallback) => {
+                    activeSubscribers[subscriberUID] = {
+                        resolution: resolution,
+                        callback: onRealtimeCallback
+                    };
+                },
+                unsubscribeBars: (subscriberUID) => {
+                    delete activeSubscribers[subscriberUID];
+                },
+                getMarks: (symbolInfo, from, to, onDataCallback, resolution) => {
+                    fetch('/marks').then(r => r.json()).then(data => {
+                        const marks = [];
+                        if (data.id) {
+                            for (let i = 0; i < data.id.length; i++) {
+                                marks.push({
+                                    id: data.id[i],
+                                    time: data.time[i],
+                                    color: data.color[i],
+                                    text: data.text[i],
+                                    label: data.label[i],
+                                    minSize: data.min_size[i]
+                                });
+                            }
+                        }
+                        onDataCallback(marks);
+                    });
+                }
+            };
+
+            window.tvWidget = new TradingView.widget({
+                fullscreen: false,
+                autosize: true,
+                symbol: 'NQ',
+                interval: '2',
+                container: 'tv_chart_container',
+                datafeed: customDatafeed,
+                library_path: '/charting_library/',
+                locale: 'en',
+                theme: 'Dark',
+                timezone: 'America/New_York',
+                disabled_features: [
+                    'header_symbol_search',
+                    'header_compare',
+                    'display_market_status',
+                    'save_chart_properties_to_local_storage'
+                ],
+                enabled_features: [
+                    'study_templates',
+                    'use_localstorage_for_settings'
+                ],
+                overrides: {
+                    "paneProperties.background": "#131722",
+                    "paneProperties.vertGridProperties.color": "#1f2434",
+                    "paneProperties.horzGridProperties.color": "#1f2434",
+                    "mainSeriesProperties.candleStyle.upColor": "#089981",
+                    "mainSeriesProperties.candleStyle.downColor": "#f23645",
+                    "mainSeriesProperties.candleStyle.drawWick": true,
+                    "mainSeriesProperties.candleStyle.drawBorder": true,
+                    "mainSeriesProperties.candleStyle.borderColor": "#378658",
+                    "mainSeriesProperties.candleStyle.borderUpColor": "#089981",
+                    "mainSeriesProperties.candleStyle.borderDownColor": "#f23645",
+                    "mainSeriesProperties.candleStyle.wickUpColor": "#089981",
+                    "mainSeriesProperties.candleStyle.wickDownColor": "#f23645"
+                }
+            });
+
+            window.tvWidget.onChartReady(() => {
+                const chart = window.tvWidget.activeChart();
+                if (chart) {
+                    chart.onIntervalChanged().subscribe(null, (interval) => {
+                        currentInterval = interval;
+                        updateTfButtons(interval);
+                        fetchAndRenderOverlays(interval);
+                    });
+
+                    // Re-draw indicators reliably whenever candle data finishes loading (on refresh, reset, or start point change)
+                    chart.onDataLoaded().subscribe(null, () => {
+                        fetchAndRenderOverlays(chart.resolution());
+                    });
+                }
+
+                setTimeout(() => {
+                    const initRes = chart ? chart.resolution() : '2';
+                    currentInterval = initRes;
+                    updateTfButtons(initRes);
+                    fetchAndRenderOverlays(initRes);
+                }, 1000);
+            });
+        });
+    </script>
+</body>
+</html>
