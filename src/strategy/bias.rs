@@ -1,16 +1,35 @@
+use crate::data::MarketDataLoader;
 use crate::types::{Candle, DirectionalBias, DolType, DrawOnLiquidity, SwingPoint, Timeframe};
+
+/// Weekly session candles that are COMPLETE as of `as_of`. A session week closes Friday 17:00 NY,
+/// so the week in progress is never included.
+pub fn completed_weeks(weekly: &[Candle], as_of: i64) -> Vec<Candle> {
+    weekly
+        .iter()
+        .filter(|c| MarketDataLoader::week_close_time(c.time) <= as_of)
+        .cloned()
+        .collect()
+}
+
+/// Weekly bias as of `as_of`, from completed weeks only. ICT sets it before the week opens
+/// (preferably on the weekend), so the week being traded must not influence it.
+pub fn weekly_bias_as_of(weekly_all: &[Candle], as_of: i64) -> (DirectionalBias, String) {
+    evaluate_weekly_bias(&completed_weeks(weekly_all, as_of))
+}
 
 /// Layer 1: Weekly Bias Determination (Episode 2: sents 154-202)
 /// Before the week opens, evaluate the expansion direction of the next weekly candle.
 /// Evaluates whether the underlying market tone is expanding lower or higher toward HTF liquidity.
+/// Structural proxy for the weekly bias. Expects COMPLETED weekly session candles only (the last
+/// element is the most recent finished week); use `weekly_bias_as_of` unless they are already filtered.
 pub fn evaluate_weekly_bias(weekly_candles: &[Candle]) -> (DirectionalBias, String) {
-    if weekly_candles.len() < 3 {
+    if weekly_candles.len() < 2 {
         return (DirectionalBias::Neutral, "Insufficient weekly data".to_string());
     }
 
     let n = weekly_candles.len();
-    let prev_week = &weekly_candles[n - 2];
-    let older_week = &weekly_candles[n - 3];
+    let prev_week = &weekly_candles[n - 1];
+    let older_week = &weekly_candles[n - 2];
 
     // Check market structure on weekly
     let mut reason = Vec::new();
@@ -40,7 +59,7 @@ pub fn evaluate_weekly_bias(weekly_candles: &[Candle]) -> (DirectionalBias, Stri
     }
 
     // If indecisive candle prior, look at last 5 weeks momentum
-    let lookback = n.min(6);
+    let lookback = n.min(5);
     let start_close = weekly_candles[n - lookback].close;
     let last_close = prev_week.close;
 
@@ -75,7 +94,8 @@ pub fn identify_daily_draw_on_liquidity(
     let mut swing_highs: Vec<SwingPoint> = Vec::new();
     let mut swing_lows: Vec<SwingPoint> = Vec::new();
 
-    for i in 2..n.saturating_sub(1) {
+    // The last candle is the session in progress, so it cannot confirm a swing: i stops at n-3.
+    for i in 1..n.saturating_sub(2) {
         let prev = &daily_candles[i - 1];
         let curr = &daily_candles[i];
         let next = &daily_candles[i + 1];
@@ -110,7 +130,9 @@ pub fn identify_daily_draw_on_liquidity(
             // Find the most prominent unviolated daily swing low below current price
             let mut target_low = None;
             for sw in swing_lows.iter().rev() {
-                if sw.price < current_price {
+                // Live only until a later candle (including the one in progress) trades through it.
+                let unraided = daily_candles[sw.index + 1..].iter().all(|c| c.low > sw.price);
+                if unraided && sw.price < current_price {
                     target_low = Some(sw);
                     break;
                 }
@@ -144,7 +166,8 @@ pub fn identify_daily_draw_on_liquidity(
             // Looking for Old Daily High (Buy-Side Liquidity) above current price
             let mut target_high = None;
             for sw in swing_highs.iter().rev() {
-                if sw.price > current_price {
+                let unraided = daily_candles[sw.index + 1..].iter().all(|c| c.high < sw.price);
+                if unraided && sw.price > current_price {
                     target_high = Some(sw);
                     break;
                 }

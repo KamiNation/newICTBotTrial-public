@@ -13,9 +13,10 @@
 
 use std::sync::OnceLock;
 
-use chrono::TimeZone;
+use chrono::{Datelike, TimeZone, Timelike, Weekday};
 use chrono_tz::America::New_York;
 
+use super::bias::weekly_bias_as_of;
 use super::execution::{detect_market_structure_shift, evaluate_execution_entry};
 use super::liquidity::{detect_liquidity_sweep_from_pools, overnight_range_pools, LiquidityPool};
 use super::{compute_dynamic_ict_levels, DynamicIctLevels};
@@ -201,7 +202,7 @@ fn batch_pipeline_agrees_with_replay() {
     let f = fixture();
     let (start, end, cutoff) = (1642723200_i64, 1642802400_i64, 1642775340_i64); // as in main.rs
     let fri: Vec<Candle> = f.all.iter().filter(|c| c.time >= start && c.time <= end).cloned().collect();
-    let w: Vec<Candle> = f.weekly.iter().filter(|c| c.time <= cutoff).cloned().collect();
+    let w: Vec<Candle> = super::bias::completed_weeks(&f.weekly, cutoff);
     let d: Vec<Candle> = f.daily.iter().filter(|c| c.time <= cutoff).cloned().collect();
     let r = super::run_ict_pipeline(
         &w, &d,
@@ -217,4 +218,124 @@ fn batch_pipeline_agrees_with_replay() {
     assert_eq!(sig.time, ny(11, 34));
     near(sig.entry_price, 14811.5, 0.05, "batch entry");
     near(sig.take_profit, 14677.0, 0.05, "batch target");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Higher-timeframe layer: weekly/daily candles must follow the CME session (Sun 18:00 -> Fri
+// 17:00 NY weekly, 18:00 -> 17:00 NY daily), and the weekly bias must come from COMPLETED weeks.
+// ---------------------------------------------------------------------------------------------
+
+fn ny_at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+    New_York.with_ymd_and_hms(y, mo, d, h, mi, 0).single().unwrap().timestamp()
+}
+
+#[test]
+fn weekly_and_daily_candles_follow_the_cme_session() {
+    let f = fixture();
+
+    // Every weekly candle opens Sunday 18:00 NY; every daily candle opens at 18:00 NY on
+    // Sun-Thu (never a calendar-midnight bucket, never a separate Sunday-evening stub).
+    for c in &f.weekly {
+        let t = New_York.timestamp_opt(c.time, 0).unwrap();
+        assert_eq!((t.weekday(), t.hour(), t.minute()), (Weekday::Sun, 18, 0), "weekly start {t}");
+    }
+    for c in &f.daily {
+        let t = New_York.timestamp_opt(c.time, 0).unwrap();
+        assert_eq!((t.hour(), t.minute()), (18, 0), "daily start {t}");
+        assert!(!matches!(t.weekday(), Weekday::Fri | Weekday::Sat), "daily start on {:?}", t.weekday());
+    }
+
+    // The week before the episode is the "indecisive candle" he describes: +27 pts on an
+    // 857-pt range. (Calendar-week bucketing turned it into a -110 candle by absorbing the
+    // -86 pt Sunday-evening session that opens the episode week.)
+    let doji = f.weekly.iter().find(|c| c.time == ny_at(2022, 1, 9, 18, 0)).expect("Jan 9 session week");
+    near(doji.open, 15590.0, 0.1, "doji open");
+    near(doji.high, 16009.2, 0.1, "doji high");
+    near(doji.low, 15152.5, 0.1, "doji low");
+    near(doji.close, 15616.8, 0.1, "doji close");
+    assert!((doji.close - doji.open).abs() / (doji.high - doji.low) < 0.05, "should be a doji");
+
+    // Jan 21 session: Thu 18:00 -> Fri 17:00. Close 14,411.0 matches the C14411.00 on frame 111.
+    let day = f.daily.iter().find(|c| c.time == ny_at(2022, 1, 20, 18, 0)).expect("Jan 21 session");
+    near(day.open, 14722.0, 0.1, "Jan 21 open");
+    near(day.high, 14858.5, 0.1, "Jan 21 high");
+    near(day.low, 14408.5, 0.1, "Jan 21 low");
+    near(day.close, 14411.0, 0.1, "Jan 21 close");
+}
+
+#[test]
+fn weekly_bias_reads_the_doji_and_ignores_the_week_in_progress() {
+    let f = fixture();
+    let (bias, reason) = weekly_bias_as_of(&f.weekly, ny(9, 29));
+    assert_eq!(bias, DirectionalBias::Bearish);
+    assert!(reason.contains("Multi-week tone"), "doji week should fall to the tone rule: {reason}");
+    assert!(!reason.contains("consecutive lower highs"), "old reason leaked back: {reason}");
+
+    // The reading is fixed from the Sunday open to the Friday close: the strongly bearish week
+    // in progress must never leak into its own bias.
+    let (start, end) = (ny_at(2022, 1, 16, 18, 0), ny(16, 59));
+    let mut t = start;
+    while t <= end {
+        assert_eq!(weekly_bias_as_of(&f.weekly, t), (bias, reason.clone()), "bias changed intraweek at {t}");
+        t += 30 * 60;
+    }
+}
+
+#[test]
+fn weekly_bias_set_on_the_weekend_uses_the_week_that_just_closed() {
+    let f = fixture();
+    // Saturday 22 Jan: the Jan 16 week (15,617 -> 14,411, lower high and lower low) is complete.
+    let (bias, reason) = weekly_bias_as_of(&f.weekly, ny_at(2022, 1, 22, 20, 0));
+    assert_eq!(bias, DirectionalBias::Bearish);
+    assert!(reason.contains("consecutive lower highs and lower lows"), "{reason}");
+}
+
+#[test]
+fn daily_draw_is_the_nearest_unraided_old_low_and_never_flickers() {
+    // At 09:29 price is ~14,745. The daily swing lows below it are Oct 12 (14,585.5) and Oct 4
+    // (14,367.8). Under the "nearest unraided old low" rule the draw is Oct 12 until a candle
+    // trades through it, then Oct 4, and it never flips back. (ICT's own pick on frame 111 is
+    // Oct 4, 14,366.75; the engine reaches it only once 14,585.5 is raided. Before the in-progress
+    // candle was made as-of, the draw was chosen against the day's FINAL close of 14,411.0, which
+    // is why it jumped straight to Oct 4: hindsight.)
+    let f = fixture();
+    let raid_time = f
+        .all
+        .iter()
+        .filter(|c| c.time >= ny(9, 29) && c.time <= ny(16, 59))
+        .find(|c| c.low <= 14585.5)
+        .map(|c| c.time)
+        .expect("price trades through 14,585.5 during the session");
+
+    let mut t = ny(9, 29);
+    while t <= ny(16, 59) {
+        let l = compute_dynamic_ict_levels(&f.all, &f.weekly, &f.daily, t);
+        let want = if t < raid_time { 14585.5 } else { 14367.8 };
+        near(l.daily_dol_price.expect("daily draw"), want, 0.05, &format!("draw at clock {t}"));
+        t += 60;
+    }
+}
+
+#[test]
+fn in_progress_session_candles_never_contain_future_prices() {
+    // At 09:29 the Jan 21 session candle must only hold bars up to 09:29: the day's final
+    // 14,858.5 high (11:23), 14,408.5 low (16:12) and 14,411.0 close (16:59) are all in the future.
+    let f = fixture();
+    let as_of = ny(9, 29);
+    let daily = MarketDataLoader::session_candles_as_of(&f.daily, &f.all, as_of);
+    let cur = daily.last().unwrap();
+    assert_eq!(cur.time, ny_at(2022, 1, 20, 18, 0));
+    let bars: Vec<&Candle> = f.all.iter().filter(|c| c.time >= cur.time && c.time <= as_of).collect();
+    near(cur.high, bars.iter().map(|c| c.high).fold(f64::MIN, f64::max), 1e-9, "as-of high");
+    near(cur.low, bars.iter().map(|c| c.low).fold(f64::MAX, f64::min), 1e-9, "as-of low");
+    near(cur.close, bars.last().unwrap().close, 1e-9, "as-of close");
+    assert!(cur.high < 14858.5 && cur.low > 14408.5 && (cur.close - 14411.0).abs() > 100.0);
+
+    // Same for the week in progress; completed weeks are untouched.
+    let weekly = MarketDataLoader::session_candles_as_of(&f.weekly, &f.all, as_of);
+    let wk = weekly.last().unwrap();
+    assert_eq!(wk.time, ny_at(2022, 1, 16, 18, 0));
+    assert!(wk.low > 14408.5 && (wk.close - 14411.0).abs() > 100.0, "week in progress leaks the future");
+    let done = f.weekly.iter().find(|c| c.time == ny_at(2022, 1, 9, 18, 0)).unwrap();
+    assert_eq!(weekly.iter().find(|c| c.time == done.time).unwrap().close, done.close);
 }

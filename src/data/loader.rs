@@ -124,20 +124,40 @@ impl MarketDataLoader {
     }
 
     /// Aggregates daily candles aligned to New York calendar days.
-    pub fn aggregate_daily(candles_1m: &[Candle]) -> Vec<Candle> {
-        let mut grouped: BTreeMap<i64, Vec<&Candle>> = BTreeMap::new();
-        for c in candles_1m {
-            let ny_dt = Utc.timestamp_opt(c.time, 0).single().unwrap().with_timezone(&New_York);
-            let day_start = New_York
-                .with_ymd_and_hms(ny_dt.year(), ny_dt.month(), ny_dt.day(), 0, 0, 0)
-                .single()
-                .map(|dt| dt.timestamp())
-                .unwrap_or(c.time);
-            grouped.entry(day_start).or_default().push(c);
-        }
+    // ---- CME Globex session helpers -------------------------------------------------------
+    // A session "day" runs 18:00 New York on the PREVIOUS calendar day to 17:00 NY, and the
+    // session week runs Sunday 18:00 to Friday 17:00 NY. Adding 6 hours of NY wall-clock time
+    // maps every bar onto its session date (Sunday 18:00 -> Monday), and stays correct across
+    // DST because 18:00 NY is always the boundary.
 
+    fn session_date(ts: i64) -> chrono::NaiveDate {
+        let ny = Utc.timestamp_opt(ts, 0).single().unwrap().with_timezone(&New_York);
+        (ny.naive_local() + chrono::Duration::hours(6)).date()
+    }
+
+    fn ny_time(date: chrono::NaiveDate, hour: u32) -> Option<i64> {
+        New_York
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), hour, 0, 0)
+            .single()
+            .map(|dt| dt.timestamp())
+    }
+
+    /// Close time (Friday 17:00 NY) of the session week that opened at `week_start`.
+    pub fn week_close_time(week_start: i64) -> i64 {
+        let sunday = Utc.timestamp_opt(week_start, 0).single().unwrap().with_timezone(&New_York).date_naive();
+        Self::ny_time(sunday + chrono::Duration::days(5), 17).unwrap_or(i64::MAX)
+    }
+
+    /// The timestamp the chart expects for a session candle: NY midnight of its session date
+    /// (Monday 00:00 for the week that opens Sunday 18:00). Engine-side candles are stamped at
+    /// the real session open so as-of filtering sees them from the moment the session starts.
+    pub fn session_chart_time(session_start: i64) -> i64 {
+        Self::ny_time(Self::session_date(session_start), 0).unwrap_or(session_start)
+    }
+
+    fn fold_groups(grouped: BTreeMap<i64, Vec<&Candle>>) -> Vec<Candle> {
         let mut res = Vec::with_capacity(grouped.len());
-        for (day_time, group) in grouped {
+        for (time, group) in grouped {
             if group.is_empty() {
                 continue;
             }
@@ -146,7 +166,6 @@ impl MarketDataLoader {
             let mut high = f64::NEG_INFINITY;
             let mut low = f64::INFINITY;
             let mut volume = 0.0;
-
             for bar in &group {
                 if bar.high > high {
                     high = bar.high;
@@ -156,67 +175,60 @@ impl MarketDataLoader {
                 }
                 volume += bar.volume;
             }
-
-            res.push(Candle {
-                time: day_time,
-                open,
-                high,
-                low,
-                close,
-                volume,
-            });
+            res.push(Candle { time, open, high, low, close, volume });
         }
-
         res
     }
 
-    /// Aggregates weekly candles aligned to New York weeks (starting Monday 00:00 NY).
+    /// Daily candles on CME session boundaries (18:00 NY -> 17:00 NY), stamped at the session
+    /// open. Sunday-evening bars belong to Monday's session, not to a separate Sunday candle.
+    pub fn aggregate_daily(candles_1m: &[Candle]) -> Vec<Candle> {
+        let mut grouped: BTreeMap<i64, Vec<&Candle>> = BTreeMap::new();
+        for c in candles_1m {
+            let date = Self::session_date(c.time);
+            let start = Self::ny_time(date - chrono::Duration::days(1), 18).unwrap_or(c.time);
+            grouped.entry(start).or_default().push(c);
+        }
+        Self::fold_groups(grouped)
+    }
+
+    /// Weekly candles on CME session boundaries (Sunday 18:00 NY -> Friday 17:00 NY), stamped at
+    /// the Sunday open. A week's close is its own Friday close, never the next Sunday evening.
     pub fn aggregate_weekly(candles_1m: &[Candle]) -> Vec<Candle> {
         let mut grouped: BTreeMap<i64, Vec<&Candle>> = BTreeMap::new();
         for c in candles_1m {
-            let ny_dt = Utc.timestamp_opt(c.time, 0).single().unwrap().with_timezone(&New_York);
-            let days_from_monday = ny_dt.weekday().num_days_from_monday() as i64;
-            let week_monday = ny_dt.date_naive() - chrono::Duration::days(days_from_monday);
-            let week_start = New_York
-                .with_ymd_and_hms(week_monday.year(), week_monday.month(), week_monday.day(), 0, 0, 0)
-                .single()
-                .map(|dt| dt.timestamp())
-                .unwrap_or(c.time);
-            grouped.entry(week_start).or_default().push(c);
+            let date = Self::session_date(c.time);
+            let monday = date - chrono::Duration::days(date.weekday().num_days_from_monday() as i64);
+            let start = Self::ny_time(monday - chrono::Duration::days(1), 18).unwrap_or(c.time);
+            grouped.entry(start).or_default().push(c);
         }
+        Self::fold_groups(grouped)
+    }
 
-        let mut res = Vec::with_capacity(grouped.len());
-        for (week_time, group) in grouped {
-            if group.is_empty() {
-                continue;
+    /// Session candles (daily or weekly) as they looked at `as_of`. Candles that have not opened
+    /// yet are dropped, and the candle in progress is rebuilt from ONLY the 1m bars that exist at
+    /// `as_of`, so no future high, low or close leaks in. Completed candles are unchanged.
+    /// Both slices must be sorted by time (they are, by construction).
+    pub fn session_candles_as_of(session_candles: &[Candle], candles_1m: &[Candle], as_of: i64) -> Vec<Candle> {
+        let visible = session_candles.partition_point(|c| c.time <= as_of);
+        let mut out: Vec<Candle> = session_candles[..visible].to_vec();
+        if let Some(cur) = out.last_mut() {
+            let next_open = session_candles.get(visible).map(|c| c.time).unwrap_or(i64::MAX);
+            let lo = candles_1m.partition_point(|b| b.time < cur.time);
+            let hi = candles_1m
+                .partition_point(|b| b.time <= as_of)
+                .min(candles_1m.partition_point(|b| b.time < next_open))
+                .max(lo);
+            let bars = &candles_1m[lo..hi];
+            if let (Some(first), Some(last)) = (bars.first(), bars.last()) {
+                cur.open = first.open;
+                cur.close = last.close;
+                cur.high = bars.iter().map(|b| b.high).fold(f64::NEG_INFINITY, f64::max);
+                cur.low = bars.iter().map(|b| b.low).fold(f64::INFINITY, f64::min);
+                cur.volume = bars.iter().map(|b| b.volume).sum();
             }
-            let open = group.first().unwrap().open;
-            let close = group.last().unwrap().close;
-            let mut high = f64::NEG_INFINITY;
-            let mut low = f64::INFINITY;
-            let mut volume = 0.0;
-
-            for bar in &group {
-                if bar.high > high {
-                    high = bar.high;
-                }
-                if bar.low < low {
-                    low = bar.low;
-                }
-                volume += bar.volume;
-            }
-
-            res.push(Candle {
-                time: week_time,
-                open,
-                high,
-                low,
-                close,
-                volume,
-            });
         }
-
-        res
+        out
     }
 
     /// Extracts candles for the Episode 2 session (Friday, January 21, 2022).

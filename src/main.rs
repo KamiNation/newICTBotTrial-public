@@ -157,16 +157,9 @@ async fn main() {
     let full_friday_15m = MarketDataLoader::aggregate_interval(&friday_1m, 900);
     let full_friday_1h = MarketDataLoader::aggregate_interval(&friday_1m, 3600);
 
-    let weekly_up_to_friday: Vec<Candle> = weekly_candles_all
-        .iter()
-        .filter(|c| c.time <= cutoff_time)
-        .cloned()
-        .collect();
-    let daily_up_to_friday: Vec<Candle> = daily_candles_all
-        .iter()
-        .filter(|c| c.time <= cutoff_time)
-        .cloned()
-        .collect();
+    let weekly_up_to_friday: Vec<Candle> = strategy::bias::completed_weeks(&weekly_candles_all, cutoff_time);
+    let daily_up_to_friday: Vec<Candle> =
+        MarketDataLoader::session_candles_as_of(&daily_candles_all, &loader.candles_1m, cutoff_time);
 
     let pipeline_result = run_ict_pipeline(
         &weekly_up_to_friday,
@@ -335,18 +328,18 @@ async fn udf_history_handler(
                 .collect();
             MarketDataLoader::aggregate_interval(&filtered, 3600)
         }
+        // Engine candles are stamped at the real session open; the chart gets NY midnight of the
+        // session date, exactly the timestamps it received before the session-boundary fix.
         "D" | "1D" => {
-            s.daily_candles_all
-                .iter()
-                .filter(|c| c.time <= current_replay_time)
-                .cloned()
+            MarketDataLoader::session_candles_as_of(&s.daily_candles_all, &s.all_1m_candles, current_replay_time)
+                .into_iter()
+                .map(|c| Candle { time: MarketDataLoader::session_chart_time(c.time), ..c })
                 .collect()
         }
         "W" | "1W" => {
-            s.weekly_candles_all
-                .iter()
-                .filter(|c| c.time <= current_replay_time)
-                .cloned()
+            MarketDataLoader::session_candles_as_of(&s.weekly_candles_all, &s.all_1m_candles, current_replay_time)
+                .into_iter()
+                .map(|c| Candle { time: MarketDataLoader::session_chart_time(c.time), ..c })
                 .collect()
         }
         _ => {

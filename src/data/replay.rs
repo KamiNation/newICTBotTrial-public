@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
-use crate::strategy::bias::{evaluate_weekly_bias, identify_daily_draw_on_liquidity};
+use crate::strategy::bias::{identify_daily_draw_on_liquidity, weekly_bias_as_of};
 use crate::types::{Candle, DirectionalBias};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,21 +214,13 @@ impl ReplayEngine {
             .unwrap_or_else(|| "Unknown".to_string());
 
         // Dynamically evaluate Weekly Bias and Daily DOL up to current_time (Zero hardcoding)
-        let weekly_up_to_now: Vec<Candle> = self
-            .weekly_candles_all
-            .iter()
-            .filter(|c| c.time <= current_time)
-            .cloned()
-            .collect();
+        let (bias, reason) = weekly_bias_as_of(&self.weekly_candles_all, current_time);
 
-        let (bias, reason) = evaluate_weekly_bias(&weekly_up_to_now);
-
-        let daily_up_to_now: Vec<Candle> = self
-            .daily_candles_all
-            .iter()
-            .filter(|c| c.time <= current_time)
-            .cloned()
-            .collect();
+        let daily_up_to_now: Vec<Candle> = crate::data::MarketDataLoader::session_candles_as_of(
+            &self.daily_candles_all,
+            &self.all_1m_candles,
+            current_time,
+        );
 
         let dol_opt = identify_daily_draw_on_liquidity(&daily_up_to_now, bias);
         let (daily_dol_desc, daily_dol_price) = match dol_opt {

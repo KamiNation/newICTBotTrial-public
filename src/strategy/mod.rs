@@ -15,7 +15,7 @@ use crate::types::{
     Candle, ChartIndicator, DirectionalBias, DrawOnLiquidity, IndicatorPoint,
     JournalEvent, TradeMark,
 };
-use bias::{evaluate_weekly_bias, identify_daily_draw_on_liquidity};
+use bias::{evaluate_weekly_bias, identify_daily_draw_on_liquidity, weekly_bias_as_of};
 use execution::{
     detect_market_structure_shift, evaluate_execution_entry, sweep_leg_extreme, ExecutionSignal,
 };
@@ -171,20 +171,14 @@ pub fn compute_dynamic_ict_levels(
         .unwrap_or_else(|| current_time.to_string());
 
     // Strictly filter candles up to current_time to eliminate lookahead bias
-    let weekly_filtered: Vec<Candle> = weekly_candles_all
-        .iter()
-        .filter(|c| c.time <= current_time)
-        .cloned()
-        .collect();
-
-    let daily_filtered: Vec<Candle> = daily_candles_all
-        .iter()
-        .filter(|c| c.time <= current_time)
-        .cloned()
-        .collect();
+    // The in-progress session candle is rebuilt from the 1m bars that exist at current_time, so its
+    // close (the "current price" the draw is measured from) is the price NOW, not the day's close.
+    let daily_filtered: Vec<Candle> =
+        MarketDataLoader::session_candles_as_of(daily_candles_all, all_1m_candles, current_time);
 
     // 1. Layer 1: Weekly Bias
-    let (weekly_bias, weekly_bias_reason) = evaluate_weekly_bias(&weekly_filtered);
+    // Completed weeks only: the week being traded must not influence its own bias.
+    let (weekly_bias, weekly_bias_reason) = weekly_bias_as_of(weekly_candles_all, current_time);
     journal_logs.push(JournalEvent {
         time: current_time,
         time_str: time_str.clone(),
